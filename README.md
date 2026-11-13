@@ -4,12 +4,13 @@
 
 🔗 **Live product: [capitaedgex.com](https://capitaedgex.com/)**
 
+**Application repositories:** [Frontend](https://github.com/amathziah/capita-edge-x-frontend) · [Backend](https://github.com/amathziah/capita-edge-x-backend)
+
 > **About this repository.** CapitaEdgeX is a commercial product and the application source is
-> private. This repo is the public technical record: the architecture, the design decisions worth
-> defending, and the parts of the codebase that carry no commercial sensitivity (the GST/SAC tax
-> engine, which is built on public tax data and included here in full).
-> **Read access to the private source is available on request** — open an issue or reach me on
-> [LinkedIn](https://www.linkedin.com/in/amathziah-j-832646214/).
+> maintained in the public frontend and backend repositories linked above. This repo is the public
+> technical record: the architecture, the design decisions worth defending, and the parts of the
+> codebase that carry no commercial sensitivity (the GST/SAC tax engine, which is built on public
+> tax data and included here in full).
 
 ![CapitaEdgeX](docs/product.png)
 
