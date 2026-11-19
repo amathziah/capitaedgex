@@ -17,11 +17,12 @@ flowchart TD
     INTENT --> ROUTE{Skill match?}
     ROUTE -->|Yes| SKILL[5A. Fixed skill steps]
     ROUTE -->|No| LOOP[5B. Gemini loop<br/>Max 8 rounds]
-    SKILL --> TOOLS[6–7. Tool registry<br/>Business data · RAG · actions]
-    LOOP --> TOOLS
-    TOOLS -->|Skill result| SAVE
-    TOOLS -->|Tool result| LOOP
-    LOOP -->|Final answer| CRITIC[8. Evidence critic]
+    SKILL --> REGISTRY[6. Tool registry]
+    LOOP --> REGISTRY
+    REGISTRY --> SERVICES[7. Data · RAG · actions]
+    SERVICES -->|Skill result| SAVE
+    SERVICES -->|Tool result| LOOP
+    LOOP -->|Final answer| CRITIC[8. Critic]
     CRITIC --> SAVE
 ```
 
