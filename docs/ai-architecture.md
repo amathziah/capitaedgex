@@ -8,26 +8,71 @@ The assistant is a bounded agentic system. It has an LLM intent router, a catalo
 
 ```mermaid
 flowchart TD
-    USER[User] --> HTTP[Authenticated AI route]
-    HTTP --> CTRL[Chat controller]
-    CTRL --> CTX[Build organization and request context]
-    CTX --> ORCH[Orchestrator]
-    ORCH --> CACHE{Non-streaming chat cache hit?}
-    CACHE -->|Yes| RETURN[Return response]
-    CACHE -->|No| TRACE[Create trace and record plan]
-    TRACE --> IR[LLM intent router]
-    IR --> SELECT{Known skill and confidence at least 0.7?}
-    SELECT -->|Yes| SKILL[Registered skill]
-    SELECT -->|No| LOOP[Gemini function-calling loop]
-    SKILL --> STEP[Tool and LLM steps]
-    STEP --> RESULT[Prepare result]
-    LOOP -->|Calls registered function| REG[Tool registry]
-    REG --> SUB[Read model, knowledge search, or action executor]
-    SUB -->|Function result| LOOP
-    LOOP -->|Final answer| CRITIC[Advisory critic]
+    USER[User request] --> L1
+
+    subgraph L1["1 · Ingress and authentication"]
+        HTTP[AI HTTP route] --> AUTH[Verify user and organization]
+        AUTH --> LIMIT[Apply per-user rate limit]
+    end
+
+    L1 --> L2
+    subgraph L2["2 · Controller and context"]
+        VALIDATE[Validate query] --> CONTEXT[Load org settings and build context]
+    end
+
+    L2 --> L3
+    subgraph L3["3 · Orchestrator entry"]
+        SESSION[Get or create in-memory session] --> CACHE{Non-streaming cache hit?}
+        CACHE -->|No| TRACE[Create trace and record plan]
+    end
+    CACHE -->|Yes| PERSIST
+    TRACE --> L4
+
+    subgraph L4["4 · Intent router"]
+        CLASSIFY[LLM classification; heuristic fallback] --> ROUTE{Registered skill at confidence ≥ 0.7?}
+    end
+
+    ROUTE -->|Yes| L5A
+    ROUTE -->|No| L5B
+    subgraph L5A["5A · Fixed skill playbook"]
+        PLAN[Run predefined steps] --> SKILL_LLM[Optional LLM draft or synthesis]
+        SKILL_LLM --> SKILL_RESULT[Prepare skill result]
+    end
+    subgraph L5B["5B · Gemini tool loop · maximum 8 tool rounds"]
+        GENERATE[Gemini answers or requests tools] -->|Function call| DECLARED
+        GENERATE -->|Final answer| CRITIC
+    end
+
+    subgraph L6["6 · Registered tool registry"]
+        DECLARED[Dispatch declared tool only]
+    end
+
+    subgraph L7["7 · Data and action services"]
+        READ[Read model: org-scoped business data]
+        RAG[Knowledge RAG: vector + full-text retrieval]
+        ACTION[Action executor: UI or server-side mutation]
+    end
+    DECLARED --> READ
+    DECLARED --> RAG
+    DECLARED --> ACTION
+    READ -->|Function response| GENERATE
+    RAG -->|Function response| GENERATE
+    ACTION -->|Function response| GENERATE
+    PLAN -->|Tool step| DECLARED
+    READ -->|Skill step result| PLAN
+    RAG -->|Skill step result| PLAN
+    ACTION -->|Skill step result| PLAN
+
+    subgraph L8["8 · Advisory critic · tool-loop path only"]
+        CRITIC[Check final text against successful tool evidence]
+    end
+
+    SKILL_RESULT --> RESULT[Prepare response]
     CRITIC --> RESULT
-    RESULT --> SAVE[Persist usage, trace, and chat history]
-    SAVE --> RETURN
+    RESULT --> L9
+    subgraph L9["9 · Persistence and response"]
+        PERSIST[Write usage, trace, and conversation records] --> RETURN[Return JSON or SSE completion]
+    end
 ```
 
 The regular function-calling loop runs for at most eight model/tool rounds. Skills use their own predefined steps. The intent router falls back to heuristics if the model is unavailable. A skill is selected only when the intent is `skill_invocation`, its ID is registered, and its confidence is at least `0.7`.

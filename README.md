@@ -31,23 +31,71 @@ The backend uses a bounded agentic workflow. An LLM intent router can select a r
 
 ```mermaid
 flowchart TD
-    USER[User request] --> AUTH[Auth, rate limit, context]
-    AUTH --> ORCH[AI orchestrator]
-    ORCH --> CACHE{Non-streaming chat cache hit?}
-    CACHE -->|Yes| RESPONSE[Return cached response]
-    CACHE -->|No| INTENT[LLM intent router]
-    INTENT --> ROUTE{Known skill with confidence at least 0.7?}
-    ROUTE -->|Yes| SKILL[Registered skill playbook]
-    ROUTE -->|No| LOOP[Gemini function-calling loop, up to 8 tool rounds]
-    SKILL --> TOOLS[Registered tool set]
-    LOOP -->|Function call| TOOLS
-    TOOLS --> DATA[Read model, knowledge retrieval, or action executor]
-    DATA -->|Tool result| LOOP
-    LOOP -->|Final text| CRITIC[Advisory critic on tool-loop path]
-    SKILL --> RESULT[Prepare result]
+    USER[User request] --> L1
+
+    subgraph L1["1 · Ingress and authentication"]
+        HTTP[AI HTTP route] --> AUTH[Verify user and organization]
+        AUTH --> LIMIT[Apply per-user rate limit]
+    end
+
+    L1 --> L2
+    subgraph L2["2 · Controller and context"]
+        VALIDATE[Validate query] --> CONTEXT[Load org settings and build context]
+    end
+
+    L2 --> L3
+    subgraph L3["3 · Orchestrator entry"]
+        SESSION[Get or create in-memory session] --> CACHE{Non-streaming cache hit?}
+        CACHE -->|No| TRACE[Create trace and record plan]
+    end
+    CACHE -->|Yes| PERSIST
+    TRACE --> L4
+
+    subgraph L4["4 · Intent router"]
+        CLASSIFY[LLM classification; heuristic fallback] --> ROUTE{Registered skill at confidence ≥ 0.7?}
+    end
+
+    ROUTE -->|Yes| L5A
+    ROUTE -->|No| L5B
+    subgraph L5A["5A · Fixed skill playbook"]
+        PLAN[Run predefined steps] --> SKILL_LLM[Optional LLM draft or synthesis]
+        SKILL_LLM --> SKILL_RESULT[Prepare skill result]
+    end
+    subgraph L5B["5B · Gemini tool loop · max 8 tool rounds"]
+        GENERATE[Gemini answers or requests tools] -->|Function call| DECLARED
+        GENERATE -->|Final answer| CRITIC
+    end
+
+    subgraph L6["6 · Registered tool registry"]
+        DECLARED[Dispatch declared tool only]
+    end
+
+    subgraph L7["7 · Data and action services"]
+        READ[Read model: org-scoped business data]
+        RAG[Knowledge RAG: vector + full-text retrieval]
+        ACTION[Action executor: UI or server-side mutation]
+    end
+    DECLARED --> READ
+    DECLARED --> RAG
+    DECLARED --> ACTION
+    READ -->|Function response| GENERATE
+    RAG -->|Function response| GENERATE
+    ACTION -->|Function response| GENERATE
+    PLAN -->|Tool step| DECLARED
+    READ -->|Skill step result| PLAN
+    RAG -->|Skill step result| PLAN
+    ACTION -->|Skill step result| PLAN
+
+    subgraph L8["8 · Advisory critic · tool-loop path only"]
+        CRITIC[Check final text against successful tool evidence]
+    end
+
+    SKILL_RESULT --> RESULT[Prepare response]
     CRITIC --> RESULT
-    RESULT --> STORE[Usage, trace, conversation persistence]
-    STORE --> RESPONSE[Return response]
+    RESULT --> L9
+    subgraph L9["9 · Persistence and response"]
+        PERSIST[Write usage, trace, and conversation records] --> RESPONSE[Return JSON or SSE completion]
+    end
 ```
 
 ### Layer-by-layer
