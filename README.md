@@ -31,71 +31,21 @@ The backend uses a bounded agentic workflow. An LLM intent router can select a r
 
 ```mermaid
 flowchart TD
-    USER[User request] --> L1
-
-    subgraph L1["1 · Ingress and authentication"]
-        HTTP[AI HTTP route] --> AUTH[Verify user and organization]
-        AUTH --> LIMIT[Apply per-user rate limit]
-    end
-
-    L1 --> L2
-    subgraph L2["2 · Controller and context"]
-        VALIDATE[Validate query] --> CONTEXT[Load org settings and build context]
-    end
-
-    L2 --> L3
-    subgraph L3["3 · Orchestrator entry"]
-        SESSION[Get or create in-memory session] --> CACHE{Non-streaming cache hit?}
-        CACHE -->|No| TRACE[Create trace and record plan]
-    end
-    CACHE -->|Yes| PERSIST
-    TRACE --> L4
-
-    subgraph L4["4 · Intent router"]
-        CLASSIFY[LLM classification; heuristic fallback] --> ROUTE{Registered skill at confidence ≥ 0.7?}
-    end
-
-    ROUTE -->|Yes| L5A
-    ROUTE -->|No| L5B
-    subgraph L5A["5A · Fixed skill playbook"]
-        PLAN[Run predefined steps] --> SKILL_LLM[Optional LLM draft or synthesis]
-        SKILL_LLM --> SKILL_RESULT[Prepare skill result]
-    end
-    subgraph L5B["5B · Gemini tool loop · max 8 tool rounds"]
-        GENERATE[Gemini answers or requests tools] -->|Function call| DECLARED
-        GENERATE -->|Final answer| CRITIC
-    end
-
-    subgraph L6["6 · Registered tool registry"]
-        DECLARED[Dispatch declared tool only]
-    end
-
-    subgraph L7["7 · Data and action services"]
-        READ[Read model: org-scoped business data]
-        RAG[Knowledge RAG: vector + full-text retrieval]
-        ACTION[Action executor: UI or server-side mutation]
-    end
-    DECLARED --> READ
-    DECLARED --> RAG
-    DECLARED --> ACTION
-    READ -->|Function response| GENERATE
-    RAG -->|Function response| GENERATE
-    ACTION -->|Function response| GENERATE
-    PLAN -->|Tool step| DECLARED
-    READ -->|Skill step result| PLAN
-    RAG -->|Skill step result| PLAN
-    ACTION -->|Skill step result| PLAN
-
-    subgraph L8["8 · Advisory critic · tool-loop path only"]
-        CRITIC[Check final text against successful tool evidence]
-    end
-
-    SKILL_RESULT --> RESULT[Prepare response]
-    CRITIC --> RESULT
-    RESULT --> L9
-    subgraph L9["9 · Persistence and response"]
-        PERSIST[Write usage, trace, and conversation records] --> RESPONSE[Return JSON or SSE completion]
-    end
+    USER[User] --> AUTH[1. Auth]
+    AUTH --> CTRL[2. Controller]
+    CTRL --> ORCH[3. Orchestrator]
+    ORCH --> CACHE{Cache hit?}
+    CACHE -->|Yes| SAVE[9. Persist and respond]
+    CACHE -->|No| INTENT[4. Intent router]
+    INTENT --> ROUTE{Skill match?}
+    ROUTE -->|Yes| SKILL[5A. Fixed skill steps]
+    ROUTE -->|No| LOOP[5B. Gemini loop<br/>Max 8 rounds]
+    SKILL --> TOOLS[6–7. Tool registry<br/>Business data · RAG · actions]
+    LOOP --> TOOLS
+    TOOLS -->|Skill result| SAVE
+    TOOLS -->|Tool result| LOOP
+    LOOP -->|Final answer| CRITIC[8. Evidence critic]
+    CRITIC --> SAVE
 ```
 
 ### Layer-by-layer

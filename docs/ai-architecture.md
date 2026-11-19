@@ -8,71 +8,21 @@ The assistant is a bounded agentic system. It has an LLM intent router, a catalo
 
 ```mermaid
 flowchart TD
-    USER[User request] --> L1
-
-    subgraph L1["1 · Ingress and authentication"]
-        HTTP[AI HTTP route] --> AUTH[Verify user and organization]
-        AUTH --> LIMIT[Apply per-user rate limit]
-    end
-
-    L1 --> L2
-    subgraph L2["2 · Controller and context"]
-        VALIDATE[Validate query] --> CONTEXT[Load org settings and build context]
-    end
-
-    L2 --> L3
-    subgraph L3["3 · Orchestrator entry"]
-        SESSION[Get or create in-memory session] --> CACHE{Non-streaming cache hit?}
-        CACHE -->|No| TRACE[Create trace and record plan]
-    end
-    CACHE -->|Yes| PERSIST
-    TRACE --> L4
-
-    subgraph L4["4 · Intent router"]
-        CLASSIFY[LLM classification; heuristic fallback] --> ROUTE{Registered skill at confidence ≥ 0.7?}
-    end
-
-    ROUTE -->|Yes| L5A
-    ROUTE -->|No| L5B
-    subgraph L5A["5A · Fixed skill playbook"]
-        PLAN[Run predefined steps] --> SKILL_LLM[Optional LLM draft or synthesis]
-        SKILL_LLM --> SKILL_RESULT[Prepare skill result]
-    end
-    subgraph L5B["5B · Gemini tool loop · maximum 8 tool rounds"]
-        GENERATE[Gemini answers or requests tools] -->|Function call| DECLARED
-        GENERATE -->|Final answer| CRITIC
-    end
-
-    subgraph L6["6 · Registered tool registry"]
-        DECLARED[Dispatch declared tool only]
-    end
-
-    subgraph L7["7 · Data and action services"]
-        READ[Read model: org-scoped business data]
-        RAG[Knowledge RAG: vector + full-text retrieval]
-        ACTION[Action executor: UI or server-side mutation]
-    end
-    DECLARED --> READ
-    DECLARED --> RAG
-    DECLARED --> ACTION
-    READ -->|Function response| GENERATE
-    RAG -->|Function response| GENERATE
-    ACTION -->|Function response| GENERATE
-    PLAN -->|Tool step| DECLARED
-    READ -->|Skill step result| PLAN
-    RAG -->|Skill step result| PLAN
-    ACTION -->|Skill step result| PLAN
-
-    subgraph L8["8 · Advisory critic · tool-loop path only"]
-        CRITIC[Check final text against successful tool evidence]
-    end
-
-    SKILL_RESULT --> RESULT[Prepare response]
-    CRITIC --> RESULT
-    RESULT --> L9
-    subgraph L9["9 · Persistence and response"]
-        PERSIST[Write usage, trace, and conversation records] --> RETURN[Return JSON or SSE completion]
-    end
+    USER[User] --> AUTH[1. Auth]
+    AUTH --> CTRL[2. Controller]
+    CTRL --> ORCH[3. Orchestrator]
+    ORCH --> CACHE{Cache hit?}
+    CACHE -->|Yes| SAVE[9. Persist and respond]
+    CACHE -->|No| INTENT[4. Intent router]
+    INTENT --> ROUTE{Skill match?}
+    ROUTE -->|Yes| SKILL[5A. Fixed skill steps]
+    ROUTE -->|No| LOOP[5B. Gemini loop<br/>Max 8 rounds]
+    SKILL --> TOOLS[6–7. Tool registry<br/>Business data · RAG · actions]
+    LOOP --> TOOLS
+    TOOLS -->|Skill result| SAVE
+    TOOLS -->|Tool result| LOOP
+    LOOP -->|Final answer| CRITIC[8. Evidence critic]
+    CRITIC --> SAVE
 ```
 
 The regular function-calling loop runs for at most eight model/tool rounds. Skills use their own predefined steps. The intent router falls back to heuristics if the model is unavailable. A skill is selected only when the intent is `skill_invocation`, its ID is registered, and its confidence is at least `0.7`.
@@ -101,52 +51,44 @@ Each layer has a narrow job and passes a shaped result to the next layer. The ta
 ```mermaid
 sequenceDiagram
     actor User
-    participant Route as Auth + AI route
-    participant Controller
-    participant Orchestrator
-    participant Intent as Intent router
-    participant Gemini
-    participant Registry as Tool registry
-    participant Data as Read model / RAG / action
-    participant Critic
+    participant API as API
+    participant Orch as Orchestrator
+    participant Model as Gemini
+    participant Tools as Tools and data
     participant DB as Supabase
 
-    User->>Route: POST /api/ai/chat
-    Route->>Controller: authenticated, rate-limited request
-    Controller->>DB: Load organization settings
-    Controller->>Orchestrator: processQuery(query, context)
-    Orchestrator->>DB: Check chat cache
-    alt cache miss
-        Orchestrator->>Intent: classify(query)
-        Intent->>Gemini: JSON intent request
-        Gemini-->>Intent: intent/domain/skill/confidence
-        alt high-confidence registered skill
-            Intent-->>Orchestrator: skill route
-            Orchestrator->>Registry: Execute fixed skill steps
-            Registry->>Data: Read business facts / RAG
-            Data-->>Registry: data + metadata
-            Registry-->>Orchestrator: skill result (possibly awaiting approval)
-        else ordinary tool-loop route
-            Intent-->>Orchestrator: tool_loop route
-            loop Up to 8 tool-calling rounds
-                Orchestrator->>Gemini: Prompt + declared tools + history/results
-                Gemini-->>Orchestrator: function calls or final text
-                opt Gemini requested tools
-                    Orchestrator->>Registry: Execute declared functions
-                    Registry->>Data: Query or perform registered action
-                    Data-->>Registry: Tool result
-                    Registry-->>Orchestrator: {data, meta}
+    User->>API: Chat request
+    API->>DB: Load organization settings
+    API->>Orch: Query and context
+    Orch->>DB: Check cache
+    alt cache hit
+        DB-->>Orch: Cached result
+    else cache miss
+        Orch->>Model: Classify intent
+        Model-->>Orch: Route and confidence
+        alt skill route
+            loop Fixed skill steps
+                Orch->>Tools: Execute tool step
+                Tools-->>Orch: Data and metadata
+            end
+            Orch->>Model: Draft or summarize if needed
+            Model-->>Orch: Skill text
+        else tool-loop route
+            loop Up to 8 tool rounds
+                Orch->>Model: Prompt, history, tools
+                Model-->>Orch: Tool call or final answer
+                opt Tool call
+                    Orch->>Tools: Execute declared tool
+                    Tools-->>Orch: Tool result
                 end
             end
-            Orchestrator->>Critic: Check final text against tool evidence
-            Critic-->>Orchestrator: advisory verdict (or skipped)
+            Orch->>Model: Critic check against evidence
+            Model-->>Orch: Advisory verdict
         end
-    else cache hit
-        Orchestrator-->>Controller: cached result
     end
-    Orchestrator-->>Controller: final result
-    Controller->>DB: Persist usage and conversation messages
-    Controller-->>User: JSON or SSE completion
+    Orch-->>API: Result and metadata
+    API->>DB: Persist usage and chat history
+    API-->>User: JSON or SSE completion
 ```
 
 ## Request and module boundaries
