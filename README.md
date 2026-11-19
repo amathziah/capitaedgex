@@ -33,10 +33,10 @@ The backend uses a bounded agentic workflow. An LLM intent router can select a r
 flowchart TD
     USER[User request] --> AUTH[Auth, rate limit, context]
     AUTH --> ORCH[AI orchestrator]
-    ORCH --> CACHE{Organization/query cache hit?}
+    ORCH --> CACHE{Non-streaming chat cache hit?}
     CACHE -->|Yes| RESPONSE[Return cached response]
     CACHE -->|No| INTENT[LLM intent router]
-    INTENT --> ROUTE{Known skill with confidence >= 0.7?}
+    INTENT --> ROUTE{Known skill with confidence at least 0.7?}
     ROUTE -->|Yes| SKILL[Registered skill playbook]
     ROUTE -->|No| LOOP[Gemini function-calling loop, up to 8 tool rounds]
     SKILL --> TOOLS[Registered tool set]
@@ -50,16 +50,21 @@ flowchart TD
     STORE --> RESPONSE[Return response]
 ```
 
-| Layer | Responsibility |
-| :--- | :--- |
-| **Intent router** | Classifies the request; high-confidence registered skill matches use a playbook |
-| **Orchestrator** | Runs skill steps or a Gemini function-calling loop capped at 8 tool rounds |
-| **Tool registry** | Declares and dispatches the tools available to Gemini |
-| **Read model** | Returns organization-scoped, query-shaped business data |
-| **Knowledge retrieval** | Combines pgvector similarity with PostgreSQL full-text search |
-| **Action executor** | Runs registered UI actions and selected server-side mutations |
-| **Critic** | Advisory second-model check on the regular tool-loop answer |
-| **Trace** | Stores plan, route, tool, and error events; action execution can append final-stage records |
+### Layer-by-layer
+
+| Layer | Input | Responsibility | Output to next layer |
+| :--- | :--- | :--- | :--- |
+| **1. Ingress and auth** | HTTP request and bearer token | Resolve user and organization; apply AI rate limit. | Authenticated request with organization context. |
+| **2. Controller/context** | Query, persona, history, conversation ID | Validate query; load organization settings and assemble currency, business, and temporal context. | Query plus AI context. |
+| **3. Session/cache** | Query and organization | Get/create in-process session; check normalized organization/query cache; create trace on cache miss. | Cached response or a traced request. |
+| **4. Intent router** | Query, recent caller context, skill descriptions | Use Gemini JSON classification with heuristic fallback; validate skill ID and confidence. | Skill route at confidence `>= 0.7`, or regular tool-loop route. |
+| **5. Orchestrator** | Intent and context | Run the selected skill playbook or Gemini function-calling loop (maximum 8 tool rounds). | Skill result, or final answer and tool evidence. |
+| **6. Tool registry** | Declared Gemini function call or skill step | Dispatch allowed tools to business reads, knowledge retrieval, analytics, or action execution. | `{ data, meta }` result or a tool error. |
+| **7. Data/action layer** | Tool arguments and organization ID | Read model returns tenant-scoped data; RAG returns knowledge chunks; action executor can perform registered side effects. | Evidence, source metadata, or action result. |
+| **8. Critic** | Final answer and successful tool results | Advisory check for unsupported claims on the regular tool-loop path. | Verdict metadata; original answer remains unchanged. |
+| **9. Persistence/response** | Result, usage, trace ID | Store usage, conversation messages, and trace records; return JSON or SSE completion. | Final response. |
+
+The cache branch applies to `POST /api/ai/chat`; `POST /api/ai/chat/stream` follows the same intent/skill/tool architecture but bypasses this chat-cache lookup. The full guide expands each layer's inputs, outputs, and failure behavior and includes a sequence diagram: **[Layer-by-layer AI architecture](docs/ai-architecture.md#layer-by-layer-execution)**.
 
 ### Hybrid RAG for business knowledge
 

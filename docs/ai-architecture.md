@@ -12,11 +12,11 @@ flowchart TD
     HTTP --> CTRL[Chat controller]
     CTRL --> CTX[Build organization and request context]
     CTX --> ORCH[Orchestrator]
-    ORCH --> CACHE{Chat cache hit?}
+    ORCH --> CACHE{Non-streaming chat cache hit?}
     CACHE -->|Yes| RETURN[Return response]
     CACHE -->|No| TRACE[Create trace and record plan]
     TRACE --> IR[LLM intent router]
-    IR --> SELECT{Known skill and confidence >= 0.7?}
+    IR --> SELECT{Known skill and confidence at least 0.7?}
     SELECT -->|Yes| SKILL[Registered skill]
     SELECT -->|No| LOOP[Gemini function-calling loop]
     SKILL --> STEP[Tool and LLM steps]
@@ -31,6 +31,78 @@ flowchart TD
 ```
 
 The regular function-calling loop runs for at most eight model/tool rounds. Skills use their own predefined steps. The intent router falls back to heuristics if the model is unavailable. A skill is selected only when the intent is `skill_invocation`, its ID is registered, and its confidence is at least `0.7`.
+
+## Layer-by-layer execution
+
+Each layer has a narrow job and passes a shaped result to the next layer. The table follows a cache-miss chat request from HTTP ingress through response persistence.
+
+| # | Layer | Input | Work performed | Output / handoff | Failure behavior / limit |
+| --- | --- | --- | --- | --- | --- |
+| 1 | **Ingress and auth** | HTTP request, bearer token, optional organization header | Global auth verifies the user, resolves the active organization through `organization_users`, then the AI route applies a per-user/IP rate limit. | Authenticated request with `req.user.organizationId` enters the controller. | Missing/invalid auth or invalid organization membership is rejected before AI code runs; rate limit returns an error response. |
+| 2 | **Controller and context** | `query`, persona, caller history, agent/conversation IDs | `chat.controller.js` validates the query. `getAIContext()` loads organization settings and constructs currency, business type, temporal context, history, and IDs. | Query plus tenant-scoped AI context passed to `processQuery()`. | Missing query returns HTTP 400. Settings lookup is caught and context falls back to defaults. |
+| 3 | **Session and cache** | Query, organization ID, user/conversation IDs | Orchestrator creates a trace ID, gets/creates an in-process session, then checks chat cache in the non-streaming path. Cache keys use organization and normalized query. On a cache miss, it records a `plan` trace. | Cache hit returns the cached result; cache miss proceeds to intent classification. | Cache identity omits persona and history; cache hit returns before a plan/route trace is written. Streaming chat bypasses this cache lookup. Sessions are not saved to `ai_sessions` by the main chat path. |
+| 4 | **Intent routing** | Query, recent request context, registered skill trigger descriptions | Intent router calls Gemini JSON classification (flash-lite first) or uses heuristic fallback. It validates returned intent, domain, registered skill ID, and confidence. | `{ intent, domain, suggestedSkill, confidence }` selects a skill only at confidence `>= 0.7`; otherwise it selects the function-calling loop. | Model/network or JSON parse failure falls back to keyword heuristics; fallback cannot select a skill. |
+| 5A | **Skill playbook** | Skill ID, query, organization context | Registry dispatches one of three fixed workflows. Skills run predetermined tool steps and may call the LLM for drafting/synthesis. Collections Sweep stops with drafts awaiting approval. | Skill status, steps, drafts/narrative/recommendation, and tool provenance. The skill path does not invoke the critic. | Tool failures may short-circuit or produce partial results; narrative/draft generation can use deterministic fallback text. Approval does not resume a persisted skill run. |
+| 5B | **Gemini tool loop** | Query, caller history, system prompt, declared functions | Gemini decides whether to answer or request a registered tool. Each tool batch is executed, returned as a function response, and the model is called again. Fallback model chain is tried on retryable provider failures. | Final text, usage, tool calls/results, chosen provider, and loop metadata. Maximum: eight tool-calling rounds, then a final generation attempt if needed. | Tool errors are returned to the model as function responses. Retryable model failures advance through the configured model chain; other failures terminate the request. |
+| 6 | **Tool registry** | Gemini function call `{name, args}` or a skill's fixed step | Registry dispatches the declared tool name to the read model, knowledge service, analytics helpers, or action executor. | Tool result in `{ data, meta }` form (or an error), logged to the trace and returned to Gemini/skill. | Unknown tool names throw and are converted to tool errors by the orchestrator. |
+| 7A | **Business read model** | Tool name and organization ID | Queries Supabase/analytics for invoices, payments, expenses, compliance tasks, customer intelligence, and dashboard summaries. Domain queries explicitly filter by `organization_id`. | Compact domain payload plus provenance metadata such as source, currency, row count, and generated time. | Database errors generally propagate; some analytics lookups are caught and represented with empty/default values. |
+| 7B | **Knowledge retrieval (RAG)** | Knowledge query and organization ID | Embeds the query, calls the hybrid search RPC, combines vector and full-text rankings, and falls back to keyword matching when needed. | Top source chunks with title/category/content and source identifiers returned as tool evidence. | Missing/unavailable hybrid search falls back to lexical search. Records need reindexing for vector results. |
+| 7C | **Action execution** | Registered action/tool and payload | Runs UI navigation/modal responses or server-side operations such as customer creation, invoice draft creation, or reminder sending. | Action result; some operations have real database/email side effects. The regular function loop has no universal approval gate. | Validation and business-rule checks vary by action; Collections Sweep's review gate applies only to that skill's draft workflow. |
+| 8 | **Critic** | Final text, original query, successful tool evidence | On the regular function-calling path, a second Gemini call checks for unsupported numbers, names, dates, and user-data claims. | Advisory verdict metadata. It does not block or revise the answer; errors fail open. | Skipped with no successful tools, unavailable model, or critic parse/call error. Never treats `ok` as a hard gate. |
+| 9 | **Persistence and response** | Skill/tool result, usage metadata, trace ID | Controller writes usage to `ai_requests`, conversation messages to `ai_conversations`/`ai_chat_messages`, while orchestrator/tool calls write trace records. Response contains text, provider, data, budget, action, and trace metadata as available. | JSON response or SSE `complete` event. Current SSE path does not emit incremental model tokens. | History failures are logged and do not fail the chat response; a response may return even when optional persistence fails. |
+
+### Chat sequence
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant Route as Auth + AI route
+    participant Controller
+    participant Orchestrator
+    participant Intent as Intent router
+    participant Gemini
+    participant Registry as Tool registry
+    participant Data as Read model / RAG / action
+    participant Critic
+    participant DB as Supabase
+
+    User->>Route: POST /api/ai/chat
+    Route->>Controller: authenticated, rate-limited request
+    Controller->>DB: Load organization settings
+    Controller->>Orchestrator: processQuery(query, context)
+    Orchestrator->>DB: Check chat cache
+    alt cache miss
+        Orchestrator->>Intent: classify(query)
+        Intent->>Gemini: JSON intent request
+        Gemini-->>Intent: intent/domain/skill/confidence
+        alt high-confidence registered skill
+            Intent-->>Orchestrator: skill route
+            Orchestrator->>Registry: Execute fixed skill steps
+            Registry->>Data: Read business facts / RAG
+            Data-->>Registry: data + metadata
+            Registry-->>Orchestrator: skill result (possibly awaiting approval)
+        else ordinary tool-loop route
+            Intent-->>Orchestrator: tool_loop route
+            loop Up to 8 tool-calling rounds
+                Orchestrator->>Gemini: Prompt + declared tools + history/results
+                Gemini-->>Orchestrator: function calls or final text
+                opt Gemini requested tools
+                    Orchestrator->>Registry: Execute declared functions
+                    Registry->>Data: Query or perform registered action
+                    Data-->>Registry: Tool result
+                    Registry-->>Orchestrator: {data, meta}
+                end
+            end
+            Orchestrator->>Critic: Check final text against tool evidence
+            Critic-->>Orchestrator: advisory verdict (or skipped)
+        end
+    else cache hit
+        Orchestrator-->>Controller: cached result
+    end
+    Orchestrator-->>Controller: final result
+    Controller->>DB: Persist usage and conversation messages
+    Controller-->>User: JSON or SSE completion
+```
 
 ## Request and module boundaries
 
@@ -55,6 +127,29 @@ Routes are mounted under `/api`; global authentication resolves the user and act
 | `src/modules/ai/infra/` | Budget interface, cache, model router, and trace persistence. |
 | `src/modules/ai/actions/executor.service.js` | Registered UI actions and server-side mutations. |
 | `src/modules/ai/agent/session.service.js` | In-process session state and optional database session load/save methods. |
+
+## Separate path for structured AI tasks
+
+Invoice parsing, invoice audits, collection drafts, settlement drafts, and command parsing do not use the main intent-router/tool-loop path. Their controllers call the stable AI service facade, which delegates JSON generation and validation to `structuredTask.service.js`.
+
+```mermaid
+flowchart LR
+    REQUEST[Structured task endpoint] --> CONTROLLER[Chat or ops controller]
+    CONTROLLER --> GATE[Credit/budget check]
+    GATE --> FACADE[AI service facade]
+    FACADE --> TASK[Structured task service]
+    TASK --> CACHE[Task response cache / in-flight lock]
+    CACHE --> RUNTIME[Gemini runtime and model fallback chain]
+    RUNTIME --> MODEL[JSON-mode Gemini generation]
+    MODEL --> VALIDATE[Task-specific source validator]
+    VALIDATE -->|Valid| RESULT[Sanitized structured result]
+    VALIDATE -->|Unsupported or invalid| ERROR[Reject result and return validation error]
+    RESULT --> AUDIT[Usage persistence]
+```
+
+Invoice text extraction validates numeric claims against the provided OCR text. Invoice audits and collection/settlement drafts validate their numeric claims against the supplied invoice. Command parsing only allows `create_customer` or `unknown`. The validator may reject unsupported numbers or malformed shapes; there is no general critic pass on these endpoints. Insights and revenue prediction are separate local/rule-based paths.
+
+The budget check is present in several controllers, but `AIBudgetService` currently returns unlimited starter usage, so that check does not enforce plan limits today.
 
 ## Skills
 
